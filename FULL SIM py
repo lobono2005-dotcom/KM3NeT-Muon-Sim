@@ -1,0 +1,321 @@
+import numpy as np # type: ignore
+import time
+
+#1.CONSTANTS
+D_det = 1170.0
+D_gen = D_det + 80.0
+
+H_det = 612.0
+H_gen = H_det+200
+
+R_gen = D_gen / 2.0
+gen_z_max = H_gen / 2.0
+gen_z_min = -H_gen / 2.0
+
+D_SPACING = 90.0  
+N_DU = 115    
+
+N_DOMS = 18
+Z_SPACING = 36.0
+
+# Consts for Photon generation & Time
+THETA_C = np.radians(42.0) # Cherenkov angle
+PHOTONS_PER_METER = 34500 
+R_DOM = 0.21 # DOM radius
+
+C_VACUUM = 0.29979 # Speed of light in vacuum (meters per nanosecond)
+N_WATER = 1.35 # Refractive index of Seawater
+V_WATER = C_VACUUM / N_WATER # Speed of light in water 
+
+
+#2.MUON GENERATION 
+def generate_muons(N):
+    # POSITIONS 
+    rho = np.random.uniform(0, R_gen, N)  
+    alpha = np.random.uniform(0, 2 * np.pi, N)
+    z = np.random.uniform(gen_z_min, gen_z_max, N)
+
+    x = rho * np.cos(alpha)
+    y = rho * np.sin(alpha)
+
+    mu_position = np.column_stack((x, y, z))
+
+    #DIRECTIONS 
+    phi = np.random.uniform(0, 2 * np.pi, N)
+    theta = np.random.uniform(0, np.pi, N)  
+
+    dx_local = np.sin(theta) * np.cos(phi)
+    dy_local = np.sin(theta) * np.sin(phi)
+    dz_local = np.cos(theta)
+    
+    # muon frame to detector frame 
+    dx_global = -np.cos(alpha) * dx_local + np.sin(alpha) * dy_local
+    dy_global = -np.sin(alpha) * dx_local - np.cos(alpha) * dy_local
+    dz_global = dz_local
+
+    mu_direction = np.column_stack((dx_global, dy_global, dz_global))
+
+    return mu_position, mu_direction
+
+
+#DU coordinates function (X,Y)
+def generate_du_positions():
+    v1 = np.array([D_SPACING, 0.0])
+    v2 = np.array([D_SPACING * np.cos(np.pi/3), D_SPACING * np.sin(np.pi/3)])
+
+    #empty list
+    positions = []
+    for i in range(-6, 7):
+        for j in range(-6, 7):
+            pos = i * v1 + j * v2
+            positions.append(pos)
+     # list to array       
+    positions = np.array(positions)
+    distances = np.linalg.norm(positions, axis=1)
+
+    # Filtering(127 DU to 115 DU)
+    closest_indices = np.argsort(distances)[:N_DU]
+    return positions[closest_indices]
+
+
+#Extantion 3D
+def build_3d_detector(du_positions):
+    dom_positions = []
+    z_start = -H_det / 2.0 # Starts exactly at -306.0
+    
+    for du in du_positions:
+        x = du[0]
+        y = du[1]
+        for i in range(N_DOMS):
+            z = z_start + (i * Z_SPACING)
+            dom_positions.append([x, y, z])
+            
+    return np.array(dom_positions)
+
+
+# DETECTION FILTER 
+def filter_triggered_doms(mu_start, mu_dir, dom_positions, max_distance=50.0):
+    # A is the mu starting point, u unit directional vectors , P DOM dom_positions
+    AP_vectors = dom_positions - mu_start
+    cross_products = np.cross(AP_vectors, mu_dir)
+
+    doca_array = np.linalg.norm(cross_products, axis=1)
+    
+    # 4. filter mask
+    triggered_mask = doca_array <= max_distance
+    
+    # 5.the surviving DOMs and their exact distances
+    doms_left = dom_positions[triggered_mask]
+    distances_left = doca_array[triggered_mask]
+    
+    return doms_left, distances_left
+    
+
+def get_rotation_matrix(w):
+    # as we already know the direction of the muon trajectory in the global frame we take it as the local z axis represented by w a unit vector
+    w = w / np.linalg.norm(w)
+    
+    # Safety checks before Gram-Schmidt orthogonalisation , we are picking an arbitrary vector x or y but we dont want that vector to be the muon travelling direction
+    if abs(w[0]) > 0.9:
+        a = np.array([0.0, 1.0, 0.0])
+    else:
+        a = np.array([1.0, 0.0, 0.0])
+    
+    # Gram-Schmidt       
+    u = a - np.dot(a, w) * w
+    u = u / np.linalg.norm(u)
+    v = np.cross(w, u)
+    
+    return np.column_stack((u, v, w))
+
+
+def generate_photon_rays(mu_dir, n_photons):
+    #Generates photon direction vectors in the Cherenkov cone and rotates them to global
+    
+    # 1. In the local frame (The cone)
+    phi = np.random.uniform(0, 2 * np.pi, n_photons)
+    
+    # Spherical to cartesian
+    x_local = np.sin(THETA_C) * np.cos(phi)
+    y_local = np.sin(THETA_C) * np.sin(phi)
+    z_local = np.full(n_photons, np.cos(THETA_C))
+    
+    local_dirs = np.column_stack((x_local, y_local, z_local))
+    
+    # 2. Rotate to Global Muon Frame
+    R = get_rotation_matrix(mu_dir)
+    global_dirs = np.dot(local_dirs, R.T)
+    
+    return global_dirs
+
+
+def Physics_engine(mu_start, mu_dir, dom_positions, step_size=1.0, max_distance=40.0):
+    
+    # Applying The FILTER
+    hit_doms, hit_distances = filter_triggered_doms(mu_start, mu_dir, dom_positions, max_distance=max_distance)
+    
+    print(f"DOM Filter reduced 2070 DOMs to just {len(hit_doms)} DOMs!")
+    
+    if len(hit_doms) == 0:
+        print(" -> Muon completely missed the detector. Skipping Phy engine!")
+        return None, None # <--- JUST ADD 'None, None' HERE!
+
+    # ENGINE
+    current_pos = np.copy(mu_start)
+    
+    #arry to keep track of the doms that detected a photon
+    dom_hit_counts = np.zeros(len(hit_doms))
+    
+    #array to keep track of when the first photon hit each DOM
+    dom_first_hit_times = np.full(len(hit_doms), np.inf)
+    
+    step_count = 0
+    start_time = time.time()
+    
+    while True:
+        # Check boundaries
+        x, y, z = current_pos[0], current_pos[1], current_pos[2]
+        radius = np.sqrt(x**2 + y**2)
+        if radius > R_gen or z < gen_z_min or z > gen_z_max:
+            break
+            
+        step_count += 1
+        
+        # Generate the 34,500 photon direction arrows for this step
+        photon_dirs = generate_photon_rays(mu_dir, int(PHOTONS_PER_METER * step_size))
+        
+        # We use enumerate to keep track of the index i of the DOM we are checking
+        for i, dom in enumerate(hit_doms):
+            
+            #similar to the A and P right triangle we used for the filter L is the hypothenious dom = P current pos = A
+            L = dom - current_pos  
+            
+            #photon-dom alignment to check if the photon is travelling in the direction of dom or away from it (or also the adjesent side in the right triangle)
+            ph_dom_align = np.dot(photon_dirs, L)
+            
+            #condition
+            valid_rays = ph_dom_align > 0
+            
+            # np.any checks the all the 34500 values(bool) in valid rays, if at least one is true it returns true
+            if not np.any(valid_rays):
+                continue
+                
+            L_sq = np.dot(L, L)
+            d2 = L_sq - (ph_dom_align[valid_rays]**2)
+            
+            # Create a mask specifically for the hits
+            hit_mask = d2 <= R_DOM**2
+            hits_on_this_dom = np.sum(hit_mask)
+            
+            if hits_on_this_dom > 0:
+                # Add the hits to this specific DOM's score
+                dom_hit_counts[i] += hits_on_this_dom
+                
+                # Delay CALCULATIONS 
+                #Muon travel time (distance = steps * size, speed = C)
+                muon_distance = step_count * step_size
+                t_muon = muon_distance / C_VACUUM
+                
+                # 2. Photon travel time (distance = projection, speed = V_WATER)
+                # We apply both masks to get only the distances of the photons that hit!
+                photon_distances = ph_dom_align[valid_rays][hit_mask]
+                t_photon = photon_distances / V_WATER
+                
+                # Total absolute physical time since simulation started
+                arrival_times = t_muon + t_photon
+                
+                # 3. Update the scoreboard with the EARLIEST hit time for this specific DOM
+                earliest_hit = np.min(arrival_times)
+                if earliest_hit < dom_first_hit_times[i]:
+                    dom_first_hit_times[i] = earliest_hit
+            
+        # Move muon forward
+        current_pos = current_pos + (mu_dir * step_size)
+        
+    total_time = time.time() - start_time
+    
+    # Statistics
+    total_hits = int(np.sum(dom_hit_counts))
+    
+    # Count how many DOMs have a score greater than 0
+    unique_doms_hit = int(np.sum(dom_hit_counts > 0))
+    
+    print(" Simulation Complete ")
+    print(f"Total distance travelled inside the volume: {step_count} m")
+    print(f"Total Photons detected : {total_hits}")
+    print(f"Total Unique DOMs Hit: {unique_doms_hit} (out of {len(hit_doms)} filtred DOMs)")
+    print(f"Total Time Taken to simulate this muon: {total_time:.2f} seconds")
+
+    if unique_doms_hit > 0:
+        print("\nBreakdown of detections per DOM:")
+        
+        # Find the very first hit time in the entire detector to act as our t=0 reference point
+        first_detector_hit = np.min(dom_first_hit_times[dom_hit_counts > 0])
+        
+        for i, counts in enumerate(dom_hit_counts):
+            if counts > 0:
+                dist = hit_distances[i]
+                relative_time = dom_first_hit_times[i] - first_detector_hit
+                print(f" -> DOM {i+1} (Distance: {dist:.1f}m) recorded {int(counts)} photons detected | Delay: {relative_time:.1f} ns")
+        
+        #extracting qnd returning the data
+        hit_mask = dom_hit_counts > 0
+        final_hit_coords = hit_doms[hit_mask]
+        final_hit_times = dom_first_hit_times[hit_mask] - first_detector_hit
+        
+        return final_hit_coords, final_hit_times
+        
+    # If there were 0 hits, return None so the main loop knows to ignore it
+    return None, None
+
+# EXECUTION & DATA EXPORT
+
+N = int(input("Enter the number of simulated muons : "))
+
+#Generate the Muons and the Detector
+mu_position, mu_direction = generate_muons(N)
+du_positions = generate_du_positions()
+detector_3d = build_3d_detector(du_positions)
+
+# 1. Create lists to collect our successful data
+all_hit_data_4d = []
+valid_muon_starts = []
+valid_muon_dirs = []
+valid_event_ids = []
+
+#Loop through EVERY generated muon
+for i in range(N):
+    print("\n" + "="*50)
+    print(f" SIMULATING MUON #{i+1} OF {N}")
+    print("="*50)
+    
+    current_start = mu_position[i]
+    current_dir = mu_direction[i]
+    
+    # 2. Run the engine and catch the returned data
+    hits, times = Physics_engine(current_start, current_dir, detector_3d, step_size=0.5)
+    
+    # 3. Only save the data if the muon actually triggered the detector!
+    if hits is not None:
+        # Merge X, Y, Z, and t into one 4D matrix
+        merged_4d_matrix = np.column_stack((hits, times))
+        
+        all_hit_data_4d.append(merged_4d_matrix)
+        valid_muon_starts.append(current_start)
+        valid_muon_dirs.append(current_dir)
+        valid_event_ids.append(i)
+
+# FILE SAVING
+print("\n" + "*"*50)
+print(f"Simulation Complete! {len(valid_event_ids)} out of {N} muons produced hits.")
+print("Saving dataset...")
+
+# np.savez packages all these separate arrays into one compressed file
+np.savez('km3net_events.npz', 
+         event_ids=valid_event_ids,
+         hit_data=np.array(all_hit_data_4d, dtype=object),
+         true_starts=valid_muon_starts,
+         true_dirs=valid_muon_dirs)
+
+print("SUCCESS: 4D Data [X, Y, Z, t] saved to 'km3net_events.npz'")
+print("*"*50)
