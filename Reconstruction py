@@ -1,0 +1,70 @@
+import numpy as np # type: ignore
+
+# 1. Define the LineFit function
+def LineFit(hit_matrix):
+    if len(hit_matrix) < 2:
+        return None
+        
+    x = hit_matrix[:, 0]
+    y = hit_matrix[:, 1]
+    z = hit_matrix[:, 2]
+    t = hit_matrix[:, 3]
+    
+    vx, x0 = np.polyfit(t, x, 1)
+    vy, y0 = np.polyfit(t, y, 1)
+    vz, z0 = np.polyfit(t, z, 1)
+    
+    velocity_vector = np.array([vx, vy, vz])
+    direction_vector = velocity_vector / np.linalg.norm(velocity_vector)
+    
+    return direction_vector
+
+# ==========================================
+# TESTING THE ALGORITHM OVER ALL EVENTS
+# ==========================================
+
+data = np.load('km3net_events.npz', allow_pickle=True)
+
+all_hit_data = data['hit_data']
+true_dirs = data['true_dirs']
+
+num_events = len(all_hit_data)
+print("Loaded events:", num_events)
+
+angular_errors = []
+failed_reconstructions = 0
+
+for i in range(num_events):
+    current_hits = all_hit_data[i]
+    actual_true_direction = true_dirs[i]
+    
+    guessed_direction = LineFit(current_hits)
+    
+    if guessed_direction is not None:
+        dot_prod = np.dot(guessed_direction, actual_true_direction)
+        dot_prod = np.clip(dot_prod, -1.0, 1.0) 
+        
+        error_angle_rad = np.arccos(dot_prod)
+        error_angle_deg = np.degrees(error_angle_rad)
+        
+        angular_errors.append(error_angle_deg)
+        
+        # Simple print for each muon
+        print("Muon", i+1, "hits:", len(current_hits), "Error:", error_angle_deg)
+    else:
+        failed_reconstructions += 1
+        print("Muon", i+1, "hits:", len(current_hits), "Failed")
+
+# ==========================================
+# SUMMARY STATISTICS
+# ==========================================
+print("\nSummary Stats:")
+print("Total Processed:", num_events)
+print("Successful:", len(angular_errors))
+print("Failed:", failed_reconstructions)
+
+if len(angular_errors) > 0:
+    print("Mean Error:", np.mean(angular_errors))
+    print("Median Error:", np.median(angular_errors))
+    print("Min Error:", np.min(angular_errors))
+    print("Max Error:", np.max(angular_errors))
